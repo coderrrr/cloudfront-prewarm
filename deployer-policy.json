@@ -1,0 +1,72 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationStacks",
+      "Effect": "Allow",
+      "Action": "cloudformation:*",
+      "Resource": "arn:aws:cloudformation:*:*:stack/cdn-prewarm*/*"
+    },
+    {
+      "Sid": "LambdaFunctions",
+      "Effect": "Allow",
+      "Action": "lambda:*",
+      "Resource": "arn:aws:lambda:*:*:function:cdn-prewarm*"
+    },
+    {
+      "Sid": "EventBridgeBusAndRules",
+      "Effect": "Allow",
+      "Action": "events:*",
+      "Resource": [
+        "arn:aws:events:*:*:event-bus/cdn-prewarm*",
+        "arn:aws:events:*:*:rule/cdn-prewarm*"
+      ]
+    },
+    {
+      "Sid": "LogGroups",
+      "Effect": "Allow",
+      "Action": "logs:*",
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/lambda/cdn-prewarm*"
+    },
+    {
+      "Sid": "AccountWideLookups",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:ValidateTemplate",
+        "cloudformation:GetTemplateSummary",
+        "cloudformation:ListStacks",
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IamRolesCreatedByTheStacks",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:DeleteRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/cdn-prewarm*"
+    },
+    {
+      "Sid": "PassThoseRolesToLambdaAndEventBridgeOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/cdn-prewarm*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": ["lambda.amazonaws.com", "events.amazonaws.com"]
+        }
+      }
+    }
+  ]
+}

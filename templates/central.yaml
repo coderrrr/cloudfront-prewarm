@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudFront edge prewarm, central stack. Creates the central event bus and the
+  prewarm Lambda. Deploy once, in the region chosen as the hub. S3 events from
+  every region reach this bus through the forwarder stack.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Routes (entries separated by ';', matched by position). Stack name must start with cdn-prewarm if you deploy with deployer-policy.json"}
+        Parameters: [S3Paths, CdnUrlPrefixes, FilePatterns]
+      - Label: {default: Edge nodes}
+        Parameters: [EdgeCountriesOrCities, EdgeLocationsUrl]
+      - Label: {default: Behaviour}
+        Parameters: [InvalidateBeforePrewarm, EventBusName, LogRetentionDays]
+    ParameterLabels:
+      S3Paths: {default: S3 paths}
+      CdnUrlPrefixes: {default: CDN URL prefixes}
+      FilePatterns: {default: File types}
+      EdgeCountriesOrCities: {default: Edge countries or cities}
+      EdgeLocationsUrl: {default: Edge node list URL}
+      InvalidateBeforePrewarm: {default: Invalidate before prewarm}
+      EventBusName: {default: Central event bus name}
+      LogRetentionDays: {default: Log retention (days)}
+
+Parameters:
+  S3Paths:
+    Type: String
+    Description: >-
+      S3 paths to watch, separated by ';'. Format bucket/prefix/ or bucket for the
+      whole bucket. Every file created or overwritten under a path, including
+      sub-folders, is prewarmed. Example: my-bucket/static/;other-bucket/img/
+    AllowedPattern: ".+"
+  CdnUrlPrefixes:
+    Type: String
+    Description: >-
+      One URL prefix per S3 path, same order. File URL = prefix + the part of the
+      file path after the S3 path. The host must be an alternate domain name or the
+      dxxxx.cloudfront.net name of a distribution in this account; the Lambda finds
+      the distribution from it. Example: https://cdn.example.com/static/;https://img.example.com/
+    AllowedPattern: ".+"
+  FilePatterns:
+    Type: String
+    Description: >-
+      Only prewarm files whose name matches one of these patterns, separated by ';'.
+      Matched against the file name, case-insensitive; * matches any characters.
+      Applies to every S3 path. * means all files. Example: *.mp4;*.m3u8;*.ts
+    Default: "*"
+    AllowedPattern: "^[^;\\s]+(;[^;\\s]+)*$"
+    ConstraintDescription: "Patterns separated by ';', without spaces or empty entries, e.g. *.mp4;*.m3u8"
+  EdgeCountriesOrCities:
+    Type: String
+    Description: >-
+      Countries and/or cities whose edge nodes are prewarmed, separated by ';', in any
+      mix. A country selects all its nodes, a city only that city's nodes. Country and
+      city names come from https://www.feitsui.com/en/article/3 ; case, accents and the
+      state suffix are optional (Montreal matches the accented "Montreal, QC" entry).
+      Example: Tokyo;Germany;United States
+    Default: Tokyo;Germany;United States
+    AllowedPattern: ".+"
+  EdgeLocationsUrl:
+    Type: String
+    Description: >-
+      JSON list of CloudFront edge nodes, fetched by the Lambda at run time. If it cannot
+      be fetched, the Lambda uses the node snapshot bundled in its code.
+    Default: https://static.cloudping.cloud/cdn/cloudfront-edge-locations.json
+    AllowedPattern: "^https://.+"
+  InvalidateBeforePrewarm:
+    Type: String
+    Description: >-
+      Invalidate the object URL before prewarming. Needed when files are overwritten,
+      otherwise the edges keep serving the old copy.
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  EventBusName:
+    Type: String
+    Description: >-
+      Name of the central event bus. Must start with cdn-prewarm if you deploy with
+      deployer-policy.json.
+    Default: cdn-prewarm-bus
+    AllowedPattern: "^[A-Za-z0-9._-]{1,256}$"
+  LogRetentionDays:
+    Type: Number
+    Description: Retention of the Lambda log group.
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+
+Resources:
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref EventBusName
+
+  PrewarmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-prewarm
+      RetentionInDays: !Ref LogRetentionDays
+
+  PrewarmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: prewarm
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt PrewarmLogGroup.Arn
+              - Effect: Allow
+                Action: cloudfront:ListDistributions
+                Resource: "*"
+              - Effect: Allow
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
+                Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*
+
+  PrewarmFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-prewarm
+      Description: Prewarms CloudFront edge nodes when objects are created or overwritten in S3.
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 900
+      Role: !GetAtt PrewarmRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PrewarmLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          S3_PATHS: !Ref S3Paths
+          CDN_URL_PREFIXES: !Ref CdnUrlPrefixes
+          FILE_PATTERNS: !Ref FilePatterns
+          EDGE_COUNTRIES_OR_CITIES: !Ref EdgeCountriesOrCities
+          EDGE_LOCATIONS_URL: !Ref EdgeLocationsUrl
+          INVALIDATE_BEFORE_PREWARM: !Ref InvalidateBeforePrewarm
+      Code:
+        ZipFile: |
+          #INLINE prewarm.py
+
+  # No dead-letter queue: a failed invocation is retried twice by Lambda (asynchronous
+  # invocation default), then dropped. Every failure is in the log group.
+  PrewarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: S3 Object Created events forwarded from every region.
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+      Targets:
+        - Id: prewarm-lambda
+          Arn: !GetAtt PrewarmFunction.Arn
+
+  PrewarmInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PrewarmFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PrewarmRule.Arn
+
+Outputs:
+  EventBusArn:
+    Description: Pass this to the forwarder stack in every region that has watched buckets.
+    Value: !GetAtt EventBus.Arn
+  PrewarmFunctionName:
+    Value: !Ref PrewarmFunction
+  LogGroupName:
+    Value: !Ref PrewarmLogGroup

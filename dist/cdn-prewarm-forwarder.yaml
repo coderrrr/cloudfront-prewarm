@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudFront edge prewarm, forwarder stack. Deploy in every region that has watched
+  buckets, including the central region. Forwards S3 Object Created events from the
+  region's default event bus to the central event bus.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Forwarding. Stack name must start with cdn-prewarm if you deploy with deployer-policy.json"}
+        Parameters: [CentralEventBusArn, BucketNames, KeyPrefixes, EnableBucketEventBridge]
+    ParameterLabels:
+      CentralEventBusArn: {default: Central event bus ARN}
+      BucketNames: {default: Bucket names in this region}
+      KeyPrefixes: {default: Key prefixes (optional)}
+      EnableBucketEventBridge: {default: Turn on EventBridge notifications for the buckets}
+
+Parameters:
+  CentralEventBusArn:
+    Type: String
+    Description: EventBusArn output of the central stack.
+    AllowedPattern: "^arn:aws[a-z-]*:events:[a-z0-9-]+:[0-9]{12}:event-bus/.+$"
+  BucketNames:
+    Type: String
+    Description: "Watched buckets in this region, separated by ';'. Example: my-bucket;other-bucket"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]*(;[a-z0-9][a-z0-9.-]*)*$"
+    ConstraintDescription: "Bucket names separated by ';', without spaces, e.g. my-bucket;other-bucket"
+  KeyPrefixes:
+    Type: String
+    Description: >-
+      Optional. Forward only objects whose key starts with one of these prefixes,
+      separated by ';'. Cuts traffic from busy unrelated paths such as access logs.
+      Leave empty to forward every object. Example: static/;img/
+    Default: ""
+    AllowedPattern: "^([^;\"\\\\]+(;[^;\"\\\\]+)*)?$"
+    ConstraintDescription: "Prefixes separated by ';', without empty entries, double quotes or backslashes, e.g. static/;img/"
+  EnableBucketEventBridge:
+    Type: String
+    Description: >-
+      Turn on "Send notifications to Amazon EventBridge" for the buckets. Existing
+      notification settings are kept, and the setting is left on when the stack is deleted.
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+Conditions:
+  EnableEventBridge: !Equals [!Ref EnableBucketEventBridge, "true"]
+  FilterByPrefix: !Not [!Equals [!Ref KeyPrefixes, ""]]
+
+Resources:
+  ForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-central-bus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
+
+  ForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward S3 Object Created events of the watched buckets to the central bus.
+      EventBusName: default
+      # Built as a JSON string because each prefix needs its own {"prefix": ...} object.
+      EventPattern: !If
+        - FilterByPrefix
+        - !Sub
+          - '{"source":["aws.s3"],"detail-type":["Object Created"],"detail":{"bucket":{"name":["${Buckets}"]},"object":{"key":[{"prefix":"${Prefixes}"}]}}}'
+          - Buckets: !Join ['","', !Split [";", !Ref BucketNames]]
+            Prefixes: !Join ['"},{"prefix":"', !Split [";", !Ref KeyPrefixes]]
+        - !Sub
+          - '{"source":["aws.s3"],"detail-type":["Object Created"],"detail":{"bucket":{"name":["${Buckets}"]}}}'
+          - Buckets: !Join ['","', !Split [";", !Ref BucketNames]]
+      Targets:
+        - Id: central-bus
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt ForwardRole.Arn
+
+  EnableEventBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableEventBridge
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-enable-s3-eventbridge
+      RetentionInDays: 30
+
+  EnableEventBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEventBridge
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bucket-notification
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt EnableEventBridgeLogGroup.Arn
+              - Effect: Allow
+                Action: [s3:GetBucketLocation, s3:GetBucketNotification, s3:PutBucketNotification]
+                # One bucket ARN per bucket name. Fn::Join needs a literal delimiter.
+                Resource: !Split
+                  - ";"
+                  - !Sub
+                    - arn:aws:s3:::${Joined}
+                    - Joined: !Join [";arn:aws:s3:::", !Split [";", !Ref BucketNames]]
+
+  EnableEventBridgeFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableEventBridge
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-enable-s3-eventbridge
+      Description: Custom resource that turns on S3 to EventBridge notifications.
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt EnableEventBridgeRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EnableEventBridgeLogGroup
+      Code:
+        ZipFile: |
+          """CloudFormation custom resource: turn on "Send notifications to Amazon EventBridge" for buckets.
+
+          Existing notification settings (SNS, SQS, Lambda) are kept. On stack delete the
+          setting is left on, because other consumers may depend on it.
+          """
+
+          import json
+          import logging
+          import os
+          import urllib.request
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3 = boto3.client("s3")
+
+
+          def _respond(event, context, status, reason="", data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or "s3-eventbridge-notification",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode()
+              request = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                               headers={"Content-Type": "", "Content-Length": str(len(body))})
+              with urllib.request.urlopen(request, timeout=30):
+                  pass
+
+
+          def _enable(bucket, region):
+              location = s3.get_bucket_location(Bucket=bucket)["LocationConstraint"] or "us-east-1"
+              if location == "EU":
+                  location = "eu-west-1"
+              if location != region:
+                  raise ValueError(f"bucket {bucket} is in {location}; deploy the forwarder stack in {location}")
+              config = s3.get_bucket_notification_configuration(Bucket=bucket)
+              config.pop("ResponseMetadata", None)
+              if "EventBridgeConfiguration" in config:
+                  return False
+              config["EventBridgeConfiguration"] = {}
+              s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=config,
+                                                       SkipDestinationValidation=True)
+              return True
+
+
+          def handler(event, context):
+              logger.info(json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              try:
+                  data = {}
+                  if event["RequestType"] in ("Create", "Update"):
+                      region = os.environ["AWS_REGION"]
+                      buckets = [b.strip() for b in event["ResourceProperties"]["BucketNames"] if b.strip()]
+                      changed = [b for b in buckets if _enable(b, region)]
+                      logger.info("EventBridge notifications turned on for %s; already on for the rest", changed or "none")
+                      data = {"ChangedBuckets": ",".join(changed)}
+                  _respond(event, context, "SUCCESS", data=data)
+              except Exception as exc:
+                  logger.exception("custom resource failed")
+                  _respond(event, context, "FAILED", reason=str(exc)[:900])
+
+  BucketEventBridgeNotification:
+    Type: Custom::S3EventBridgeNotification
+    Condition: EnableEventBridge
+    Properties:
+      ServiceToken: !GetAtt EnableEventBridgeFunction.Arn
+      BucketNames: !Split [";", !Ref BucketNames]
+
+Outputs:
+  ForwardRuleArn:
+    Value: !GetAtt ForwardRule.Arn
