@@ -1,39 +1,39 @@
-# CloudFront 边缘节点预热
+# CloudFront Edge Location Prewarming
 
-S3 指定路径下有对象新增或覆盖时，Lambda 到指定国家或城市的每个 CloudFront 边缘节点各完整下载一次该对象，让这些节点提前缓存最新版本。
+When an object is created or overwritten under a configured S3 path, a Lambda function downloads that object once, in full, from every CloudFront edge location in the configured countries or cities, so those locations cache the latest version ahead of user requests.
 
-![架构图](architecture.png)
+![Architecture diagram](architecture.png)
 
-架构图源文件是 `architecture.drawio`，可以用 draw.io 打开编辑。`architecture.png` 里也嵌入了图的源数据，同样可以直接用 draw.io 打开。
+The diagram source is `architecture.drawio`, which you can open and edit in draw.io. `architecture.png` also embeds the diagram source, so draw.io can open it directly too.
 
 ```
-各区域 S3 桶 ──(Object Created)──> 该区域 default 事件总线
-                                      │ 转发规则（按桶名、可选按前缀过滤）
+S3 bucket in each region ──(Object Created)──> default event bus in that region
+                                      │ forwarding rule (filters by bucket name, optionally by prefix)
                                       ▼
-                         中心区域 cdn-prewarm-bus ──> 预热 Lambda
-                                                        ├─ 1. CloudFront 失效该 URL，等待完成
-                                                        └─ 2. 逐节点 GET <域名>/<路径>
+                         cdn-prewarm-bus in central region ──> prewarm Lambda
+                                                        ├─ 1. Invalidate the URL in CloudFront and wait for completion
+                                                        └─ 2. GET <domain>/<path> from each edge location
 ```
 
-定向到指定节点的方法：解析 `<分发ID前缀>.<节点代码>.cloudfront.net`（例如 `d111111abcdef8.NRT57-P3.cloudfront.net`）得到该节点 IP，再以站点域名作为 Host/SNI 连接该 IP。响应头 `x-amz-cf-pop` 用来确认确实由目标节点处理。
+How a request is pinned to a specific edge location: resolve `<distribution ID prefix>.<location code>.cloudfront.net` (for example `d111111abcdef8.NRT57-P3.cloudfront.net`) to get that location's IP, then connect to that IP using the site domain as Host/SNI. The `x-amz-cf-pop` response header confirms that the target location handled the request.
 
-## 文件
+## Files
 
-| 文件 | 说明 |
+| File | Description |
 |---|---|
-| `dist/cdn-prewarm-central.yaml` | 中心栈：事件总线、预热 Lambda、日志组。只部署一次。 |
-| `dist/cdn-prewarm-forwarder.yaml` | 转发栈：部署在每个有被监控桶的区域，包括中心区域本身。 |
-| `src/prewarm.py`、`src/enable_s3_eventbridge.py` | Lambda 源码，已内联到上面的模板里。 |
-| `templates/`、`build.py` | 模板源文件。改了源码后运行 `python3 build.py` 重新生成 `dist/`。 |
-| `refresh_edge_snapshot.py` | 更新 Lambda 代码里内置的节点快照，见"节点列表"一节。 |
-| `architecture.drawio`、`architecture.png` | 架构图。 |
-| `deployer-policy.json` | 部署、更新、删除两个栈所需的 IAM 权限，见"部署所需权限"一节。 |
+| `dist/cdn-prewarm-central.yaml` | Central stack: event bus, prewarm Lambda, log group. Deploy once. |
+| `dist/cdn-prewarm-forwarder.yaml` | Forwarder stack: deploy in every region that has a monitored bucket, including the central region itself. |
+| `src/prewarm.py`, `src/enable_s3_eventbridge.py` | Lambda source code, inlined into the templates above. |
+| `templates/`, `build.py` | Template sources. After changing the source code, run `python3 build.py` to regenerate `dist/`. |
+| `refresh_edge_snapshot.py` | Updates the edge location snapshot built into the Lambda code. See "Edge location list". |
+| `architecture.drawio`, `architecture.png` | Architecture diagram. |
+| `deployer-policy.json` | IAM permissions needed to deploy, update, and delete both stacks. See "Permissions required for deployment". |
 
-## 部署
+## Deployment
 
-前提：桶、CloudFront 分发和中心栈在同一个 AWS 账号。Lambda 要在这个账号里按域名查找分发。
+Prerequisite: the buckets, the CloudFront distributions, and the central stack are in the same AWS account. The Lambda function looks up distributions by domain name in this account.
 
-**1. 部署中心栈**（选一个区域作为中心，例如 us-east-1）
+**1. Deploy the central stack** (pick one region as the central region, for example us-east-1)
 
 ```bash
 aws cloudformation deploy --region us-east-1 --stack-name cdn-prewarm \
@@ -45,9 +45,9 @@ aws cloudformation deploy --region us-east-1 --stack-name cdn-prewarm \
     "FilePatterns=*"
 ```
 
-记下输出 `EventBusArn`。
+Note the `EventBusArn` output.
 
-**2. 在每个有桶的区域部署转发栈**
+**2. Deploy the forwarder stack in every region that has a bucket**
 
 ```bash
 aws cloudformation deploy --region us-west-2 --stack-name cdn-prewarm-forwarder \
@@ -58,23 +58,23 @@ aws cloudformation deploy --region us-west-2 --stack-name cdn-prewarm-forwarder 
     "KeyPrefixes=static/;img/"
 ```
 
-用控制台部署也可以：CloudFormation → 创建堆栈 → 上传模板文件，然后按页面填写参数。
+You can also deploy from the console: CloudFormation → Create stack → Upload a template file, then fill in the parameters on the page.
 
-### 部署所需权限
+### Permissions required for deployment
 
-`deployer-policy.json` 是部署、更新、删除这两个栈所需的权限，可以直接挂给部署用的 IAM 用户或角色。我用一个只挂了这份策略的角色，实际跑过两个栈的创建、更新和删除。
+`deployer-policy.json` contains the permissions needed to deploy, update, and delete both stacks. You can attach it directly to the IAM user or role used for deployment. It has been tested by creating, updating, and deleting both stacks with a role that had only this policy attached.
 
-为了好读，CloudFormation、Lambda、EventBridge、CloudWatch Logs 都合并成了 `cloudformation:*`、`lambda:*`、`events:*`、`logs:*`，但资源仍限定在 `cdn-prewarm` 开头的栈、函数、事件总线、规则和日志组。少数只能对 `*` 授权的查询操作（如 `cloudformation:ValidateTemplate`、`logs:DescribeLogGroups`）单独列在一条里。
+For readability, CloudFormation, Lambda, EventBridge, and CloudWatch Logs actions are merged into `cloudformation:*`, `lambda:*`, `events:*`, and `logs:*`, but resources are still limited to stacks, functions, event buses, rules, and log groups whose names start with `cdn-prewarm`. The few read actions that can only be granted on `*` (such as `cloudformation:ValidateTemplate` and `logs:DescribeLogGroups`) are listed in a separate statement.
 
-IAM 没有合并成 `iam:*`，而是逐条列出。原因是 `iam:*` 会去掉 `iam:PassRole` 只能交给 Lambda 和 EventBridge 的限制，还会允许给角色挂任意托管策略（例如 `AdministratorAccess`），安全评审通常不会通过。
+IAM actions are listed one by one instead of being merged into `iam:*`. With `iam:*`, `iam:PassRole` would no longer be limited to Lambda and EventBridge, and the policy would allow attaching any managed policy (for example `AdministratorAccess`) to a role. Security reviews usually reject that.
 
-使用前提：
+Requirements:
 
-- 栈名必须以 `cdn-prewarm` 开头（例如 `cdn-prewarm`、`cdn-prewarm-forwarder`），中心栈的 `EventBusName` 也要以 `cdn-prewarm` 开头（默认 `cdn-prewarm-bus`）。策略里的资源都是按这个前缀限定的。要换前缀，把策略里所有 `cdn-prewarm` 一起替换。
-- 部署时要加 `--capabilities CAPABILITY_IAM`，在控制台则勾选"我确认 AWS CloudFormation 可能创建 IAM 资源"。
-- 策略里的 `iam:PassRole` 限定只能把这些角色交给 Lambda 和 EventBridge 使用。
+- Stack names must start with `cdn-prewarm` (for example `cdn-prewarm` and `cdn-prewarm-forwarder`), and the central stack's `EventBusName` must also start with `cdn-prewarm` (default `cdn-prewarm-bus`). All resources in the policy are scoped by this prefix. To use a different prefix, replace every `cdn-prewarm` in the policy.
+- Pass `--capabilities CAPABILITY_IAM` when deploying. In the console, check "I acknowledge that AWS CloudFormation might create IAM resources".
+- The `iam:PassRole` statement in the policy only allows passing these roles to Lambda and EventBridge.
 
-用控制台上传模板时，控制台会先把模板存到 `cf-templates-*` 桶，还需要加下面这条。这一条没有包含在上面的实测里：
+When you upload a template in the console, the console first stores it in a `cf-templates-*` bucket, so you also need the statement below. This statement was not part of the test described above:
 
 ```json
 {
@@ -84,89 +84,89 @@ IAM 没有合并成 `iam:*`，而是逐条列出。原因是 `iam:*` 会去掉 `
 }
 ```
 
-如果组织用 SCP 要求创建角色时必须带权限边界（permissions boundary），需要在模板的三个 `AWS::IAM::Role` 上加 `PermissionsBoundary` 属性。
+If your organization has an SCP that requires a permissions boundary when creating roles, add a `PermissionsBoundary` property to the three `AWS::IAM::Role` resources in the templates.
 
-栈创建的三个角色各自的权限：
+Permissions of the three roles created by the stacks:
 
-| 栈 | 角色 | 使用者 | 权限 |
+| Stack | Role | Used by | Permissions |
 |---|---|---|---|
-| 中心栈 | `PrewarmRole` | 预热 Lambda | 写自己的日志组；`cloudfront:ListDistributions`（只能写 `*`）；本账号所有分发上的 `cloudfront:CreateInvalidation`、`cloudfront:GetInvalidation` |
-| 转发栈 | `ForwardRole` | 转发规则 | `events:PutEvents`，只限中心事件总线 |
-| 转发栈 | `EnableEventBridgeRole` | 开通通知的 Lambda | 写自己的日志组；`BucketNames` 里每个桶的 `s3:GetBucketLocation`、`s3:GetBucketNotification`、`s3:PutBucketNotification` |
+| Central stack | `PrewarmRole` | Prewarm Lambda | Write to its own log group; `cloudfront:ListDistributions` (only grantable on `*`); `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` on all distributions in this account |
+| Forwarder stack | `ForwardRole` | Forwarding rule | `events:PutEvents`, limited to the central event bus |
+| Forwarder stack | `EnableEventBridgeRole` | Lambda that turns on notifications | Write to its own log group; `s3:GetBucketLocation`, `s3:GetBucketNotification`, and `s3:PutBucketNotification` on each bucket in `BucketNames` |
 
-## 参数
+## Parameters
 
-### 中心栈（对应 Lambda 环境变量）
+### Central stack (mapped to Lambda environment variables)
 
-| 参数 | 环境变量 | 说明 |
+| Parameter | Environment variable | Description |
 |---|---|---|
-| S3Paths | `S3_PATHS` | 监控的 S3 路径，`;` 分隔。格式 `桶/前缀/`；只写 `桶` 表示整个桶。前缀按目录处理，`static` 等同于 `static/`。 |
-| CdnUrlPrefixes | `CDN_URL_PREFIXES` | 每个 S3 路径对应一个 URL 前缀，按位置一一对应。域名填分发的备用域名（如 `www.example.com`）或 `dxxxx.cloudfront.net`。 |
-| EdgeCountriesOrCities | `EDGE_COUNTRIES_OR_CITIES` | 要预热的国家和/或城市，`;` 分隔，可以混用，例如 `Tokyo;Germany;United States`。默认值也是这个。规则见下方"国家和城市的写法"。 |
-| FilePatterns | `FILE_PATTERNS` | 只预热文件名匹配这些模式的文件，`;` 分隔，例如 `*.mp4;*.m3u8;*.ts`。默认 `*`，即所有文件。按文件名（key 最后一个 `/` 之后的部分）匹配，不区分大小写，`*` 匹配任意字符，`?` 匹配一个字符。对所有 S3 路径生效。不匹配的文件跳过，日志里记一条 `file name does not match FILE_PATTERNS`。 |
-| InvalidateBeforePrewarm | `INVALIDATE_BEFORE_PREWARM` | 默认 `true`，预热前先失效该 URL 并等待完成。覆盖上传时必须开启，否则节点会继续返回旧缓存。 |
-| EdgeLocationsUrl | `EDGE_LOCATIONS_URL` | 节点列表 JSON，Lambda 运行时拉取，缓存 1 小时。默认 `https://static.cloudping.cloud/cdn/cloudfront-edge-locations.json`。拉取失败时改用代码内置的快照，见"节点列表"一节。 |
+| S3Paths | `S3_PATHS` | S3 paths to monitor, separated by `;`. Format `bucket/prefix/`; `bucket` alone means the whole bucket. Prefixes are treated as directories, so `static` is the same as `static/`. |
+| CdnUrlPrefixes | `CDN_URL_PREFIXES` | One URL prefix per S3 path, matched by position. Use the distribution's alternate domain name (such as `www.example.com`) or `dxxxx.cloudfront.net` as the domain. |
+| EdgeCountriesOrCities | `EDGE_COUNTRIES_OR_CITIES` | Countries and/or cities to prewarm, separated by `;`. You can mix them, for example `Tokyo;Germany;United States`, which is also the default. See "Writing country and city names" below. |
+| FilePatterns | `FILE_PATTERNS` | Only prewarm files whose names match these patterns, separated by `;`, for example `*.mp4;*.m3u8;*.ts`. Default `*`, meaning all files. Matching uses the file name (the part of the key after the last `/`), is case-insensitive, `*` matches any characters, and `?` matches one character. Applies to all S3 paths. Files that don't match are skipped, with a `file name does not match FILE_PATTERNS` log entry. |
+| InvalidateBeforePrewarm | `INVALIDATE_BEFORE_PREWARM` | Default `true`: invalidate the URL and wait for completion before prewarming. Keep it on if files are overwritten, otherwise edge locations keep serving the old cached copy. |
+| EdgeLocationsUrl | `EDGE_LOCATIONS_URL` | Edge location list JSON, fetched by the Lambda at runtime and cached for 1 hour. Default `https://static.cloudping.cloud/cdn/cloudfront-edge-locations.json`. If fetching fails, the snapshot built into the code is used. See "Edge location list". |
 
-只需要配置路径，不需要列出具体文件。路径下（包括子目录）任何文件新增或覆盖，都会自动预热这个文件。部署之前就已经存在的文件不会被预热。
+You only configure paths, not individual files. Any file created or overwritten under a path (including subdirectories) is prewarmed automatically. Files that existed before deployment are not prewarmed.
 
-预热 URL = URL 前缀 + 文件在 S3 路径之后的部分，会做 URL 编码。例如：
+Prewarm URL = URL prefix + the part of the key after the S3 path, URL-encoded. For example:
 
-| S3 路径 | URL 前缀 | 上传的文件 | 预热 URL |
+| S3 path | URL prefix | Uploaded file | Prewarm URL |
 |---|---|---|---|
 | `bucket-a/static/` | `https://www.example.com/static/` | `s3://bucket-a/static/js/app.js` | `https://www.example.com/static/js/app.js` |
 | `bucket-b/img/` | `https://img.example.com/` | `s3://bucket-b/img/logo.png` | `https://img.example.com/logo.png` |
 
-同一个文件匹配多条路径时，每条都会预热。
+If a file matches several paths, each of them is prewarmed.
 
-分发不用单独配置。Lambda 用 URL 前缀里的域名调 CloudFront API 查找对应的分发：先找完全相同的备用域名，再找通配域名（`*.example.com` 匹配 `cdn.example.com`，不匹配 `a.b.example.com`），也可以直接写 `dxxxx.cloudfront.net`。查询结果缓存 1 小时，找不到时会立即重查一次。仍然找不到时，本次调用失败并重试，日志里会写明是哪个域名。
+Distributions don't need separate configuration. The Lambda uses the domain in the URL prefix to find the matching distribution through the CloudFront API: first an exact alternate domain name match, then a wildcard match (`*.example.com` matches `cdn.example.com` but not `a.b.example.com`). You can also use `dxxxx.cloudfront.net` directly. Lookup results are cached for 1 hour, and a miss triggers one immediate re-lookup. If the distribution still isn't found, the invocation fails and is retried, and the log names the domain.
 
-#### 国家和城市的写法
+#### Writing country and city names
 
-名称取自节点列表的 `country` 和 `city` 字段，也可以在 `src/prewarm.py` 的 `EDGE_SNAPSHOT` 里查到。
+Names come from the `country` and `city` fields of the edge location list. You can also find them in `EDGE_SNAPSHOT` in `src/prewarm.py`.
 
-- 写国家，预热这个国家的全部节点，例如 `Japan`、`United States`。香港和台北的节点在 `China` 下。
-- 写城市，只预热这个城市的节点，例如 `Tokyo`、`Hong Kong`、`Frankfurt`。
-- 国家和城市可以混用。重叠的节点只预热一次，例如 `Japan;Tokyo` 等同于 `Japan`。
-- 不区分大小写，可以不写重音、空格和标点：`montreal` 能匹配 `Montréal, QC`，`Washington DC` 能匹配 `Washington D. C.`。
-- 城市名后的州或地区代码可以省略：`Los Angeles` 能匹配 `Los Angeles, CA`，`Taipei` 能匹配 `Taipei, TW`。`Dallas/Fort Worth, TX` 写 `Dallas` 或 `Fort Worth` 都可以。
-- 匹配不到节点的名称会记一条警告，其余名称照常预热。
+- A country prewarms all edge locations in that country, for example `Japan` or `United States`. Hong Kong and Taipei locations are listed under `China`.
+- A city prewarms only the locations in that city, for example `Tokyo`, `Hong Kong`, or `Frankfurt`.
+- Countries and cities can be mixed. Overlapping locations are prewarmed once, so `Japan;Tokyo` is the same as `Japan`.
+- Matching is case-insensitive and ignores accents, spaces, and punctuation: `montreal` matches `Montréal, QC`, and `Washington DC` matches `Washington D. C.`.
+- The state or region code after a city name can be omitted: `Los Angeles` matches `Los Angeles, CA`, and `Taipei` matches `Taipei, TW`. For `Dallas/Fort Worth, TX`, either `Dallas` or `Fort Worth` works.
+- A name that matches no edge location logs a warning, and the other names are prewarmed as usual.
 
-每次预热的 `prewarm_start` 日志里有 `nodes_per_name` 字段，列出每个名称匹配到几个节点，例如 `{"Japan": 7, "Hong Kong": 5}`，可以用来检查名称有没有写对。
+The `prewarm_start` log entry of each prewarm has a `nodes_per_name` field showing how many locations each name matched, for example `{"Japan": 7, "Hong Kong": 5}`. Use it to check that names are written correctly.
 
-### 转发栈
+### Forwarder stack
 
-| 参数 | 说明 |
+| Parameter | Description |
 |---|---|
-| CentralEventBusArn | 中心栈输出的 `EventBusArn`。 |
-| BucketNames | 本区域被监控的桶，`;` 分隔，不能有空格，例如 `bucket-a;bucket-b`。 |
-| KeyPrefixes | 可选，只转发这些前缀下的对象，`;` 分隔，例如 `static/;img/`。建议填写，可以挡掉访问日志等无关写入。 |
+| CentralEventBusArn | The `EventBusArn` output of the central stack. |
+| BucketNames | Monitored buckets in this region, separated by `;` with no spaces, for example `bucket-a;bucket-b`. |
+| KeyPrefixes | Optional. Only forward objects under these prefixes, separated by `;`, for example `static/;img/`. Recommended, because it filters out unrelated writes such as access logs. |
+| EnableBucketEventBridge | Default `true`: turns on "Send notifications to Amazon EventBridge" for the buckets, keeping any other notification configuration already on the buckets. Deleting the stack does not turn this setting off. |
 
-所有列表参数（中心栈和转发栈）都用 `;` 分隔。
-| EnableBucketEventBridge | 默认 `true`，为桶打开 "Send notifications to Amazon EventBridge"，保留桶上已有的其他通知配置。删除栈时不会关闭这个开关。 |
+All list parameters (in both the central and forwarder stacks) are separated by `;`.
 
-## 节点列表
+## Edge location list
 
-Lambda 按下面的顺序取节点列表：
+The Lambda gets the edge location list in this order:
 
-1. 1 小时内从 `EDGE_LOCATIONS_URL` 拉到的列表。
-2. 重新从 `EDGE_LOCATIONS_URL` 拉取。
-3. 拉取失败（网络错误、非 200、不是 JSON、列表里没有节点）时，用本次 Lambda 运行环境里上一次拉取成功的列表。
-4. 运行环境里还没有拉取成功过，就用代码内置的快照。快照只保留"国家 → 城市 → 节点代码"，生成日期写在 `EDGE_SNAPSHOT_DATE`。
+1. The list fetched from `EDGE_LOCATIONS_URL` within the last hour.
+2. A fresh fetch from `EDGE_LOCATIONS_URL`.
+3. If the fetch fails (network error, non-200 status, invalid JSON, or no locations in the list), the last list successfully fetched in the current Lambda execution environment.
+4. If the execution environment has never fetched the list successfully, the snapshot built into the code. The snapshot keeps only "country → city → location code", and its generation date is in `EDGE_SNAPSHOT_DATE`.
 
-每次预热的 `prewarm_start` 日志里有 `edge_list` 字段，记录本次用的是哪份列表：`url`、`url, fetched <时间>` 或 `snapshot <日期>`。
+The `prewarm_start` log entry of each prewarm has an `edge_list` field recording which list was used: `url`, `url, fetched <time>`, or `snapshot <date>`.
 
-更新快照：
+To update the snapshot:
 
 ```bash
-python3 refresh_edge_snapshot.py   # 重写 src/prewarm.py 里的 EDGE SNAPSHOT 段
-python3 build.py                   # 重新生成 dist/ 模板
+python3 refresh_edge_snapshot.py   # rewrites the EDGE SNAPSHOT section in src/prewarm.py
+python3 build.py                   # regenerates the dist/ templates
 ```
 
-然后用新模板更新中心栈。
+Then update the central stack with the new template.
 
-## 查看结果
+## Viewing results
 
-日志组 `/aws/lambda/<中心栈名>-prewarm`。每个节点一完成就写一条 `prewarm_result`，所有节点结束后每个文件写一条 `prewarm_summary`。CloudWatch Logs Insights 查询没成功的节点：
+Log group: `/aws/lambda/<central stack name>-prewarm`. A `prewarm_result` entry is written as soon as each edge location finishes, and a `prewarm_summary` entry is written per file after all locations finish. CloudWatch Logs Insights query for locations that did not succeed:
 
 ```
 fields @timestamp, url, node, outcome, error
@@ -174,27 +174,27 @@ fields @timestamp, url, node, outcome, error
 | sort @timestamp desc
 ```
 
-`prewarm_result` 的 `outcome` 字段：
+The `outcome` field of `prewarm_result`:
 
-| outcome | 含义 |
+| outcome | Meaning |
 |---|---|
-| `ok` | 返回 2xx，且 `x-amz-cf-pop` 等于目标节点 |
-| `failed` | 这个节点出错：解析不到 IP、所有 IP 都连不上、超时、返回非 2xx、由别的节点响应，或其他任何异常 |
-| `not_started` | Lambda 剩余时间不足 60 秒，没有发起请求 |
-| `aborted` | 下载到一半时 Lambda 剩余时间不足 15 秒，主动中止 |
+| `ok` | Returned 2xx, and `x-amz-cf-pop` equals the target location |
+| `failed` | This location had an error: no IP resolved, none of the IPs reachable, timeout, non-2xx response, response from a different location, or any other exception |
+| `not_started` | Less than 60 seconds of Lambda time remained, so no request was sent |
+| `aborted` | The download was stopped midway because less than 15 seconds of Lambda time remained |
 
-`etag_match` 表示节点返回的 ETag 与 S3 事件中的一致。`prewarm_summary` 里有各类结果的数量，以及 `failed_nodes`、`unfinished_nodes`（`not_started` 和 `aborted` 的节点）、`skipped_urls`。
+`etag_match` indicates whether the ETag returned by the location matches the one in the S3 event. `prewarm_summary` contains counts for each outcome, plus `failed_nodes`, `unfinished_nodes` (locations that were `not_started` or `aborted`), and `skipped_urls`.
 
-## 用 curl 验证
+## Verifying with curl
 
-上传文件后，用 curl 直接请求某个节点，看它是否已经缓存了新文件：
+After uploading a file, request it from a specific edge location with curl to check whether that location has cached the new file:
 
 ```bash
-DOMAIN=www.example.com              # CdnUrlPrefixes 里的域名
-FILE_PATH='/static/js/应用.js'       # 要验证的文件路径，可以含中文或空格，下面会自动做 URL 编码
-NODE=NRT12-P5                       # 节点代码，从这次预热的 prewarm_result 日志里取，见下方说明
+DOMAIN=www.example.com              # the domain in CdnUrlPrefixes
+FILE_PATH='/static/js/my app.js'    # path of the file to check; may contain spaces or non-ASCII characters, it is URL-encoded below
+NODE=NRT12-P5                       # location code, taken from this prewarm's prewarm_result logs; see notes below
 
-# 分发域名 dxxxx.cloudfront.net 的前缀。域名走通配备用域名（*.example.com）时，这里查不到，请到 CloudFront 控制台复制
+# Prefix of the distribution domain dxxxx.cloudfront.net. If the domain uses a wildcard alternate domain name (*.example.com), this lookup finds nothing; copy it from the CloudFront console instead
 DIST=$(aws cloudfront list-distributions --output text \
   --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, '$DOMAIN')].DomainName | [0]" | cut -d. -f1)
 
@@ -205,11 +205,11 @@ curl -sI -m 15 --retry 3 --retry-all-errors -H 'Accept-Encoding: gzip, deflate, 
   "https://$DOMAIN$URL_PATH" | grep -iE '^(HTTP/|x-cache:|x-amz-cf-pop:|etag:|age:)'
 ```
 
-`--connect-to` 让 curl 把连接发到节点域名 `dxxxx.<节点代码>.cloudfront.net`，网址、Host 和 SNI 仍然是站点域名，和用户真实访问时一样。curl 会自己解析节点域名，一个 IP 连不上会自动换下一个；连接中途被重置时，`--retry 3 --retry-all-errors` 会再试最多 3 次（需要 curl 7.71 及以上，macOS 自带的版本满足）。
+`--connect-to` makes curl connect to the location domain `dxxxx.<location code>.cloudfront.net` while the URL, Host, and SNI stay the site domain, the same as a real user request. curl resolves the location domain itself and moves on to the next IP if one is unreachable. If the connection is reset midway, `--retry 3 --retry-all-errors` tries up to 3 more times (requires curl 7.71 or later; the version shipped with macOS qualifies).
 
-不要把 `dxxxx.<节点代码>.cloudfront.net` 直接当网址访问：CloudFront 只认分发的备用域名和 `dxxxx.cloudfront.net`，HTTPS 会握手失败，HTTP 会返回 403。这个域名只用来找到节点的 IP。
+Don't use `dxxxx.<location code>.cloudfront.net` as the URL directly. CloudFront only accepts the distribution's alternate domain names and `dxxxx.cloudfront.net`, so HTTPS fails the handshake and HTTP returns 403. That domain is only used to find the location's IP.
 
-预热成功时的输出类似：
+Output for a successful prewarm looks like this:
 
 ```
 HTTP/2 200
@@ -219,15 +219,15 @@ x-amz-cf-pop: NRT12-P5
 age: 55
 ```
 
-判断方法：
+How to read it:
 
-- `x-amz-cf-pop` 等于 `NODE`，说明请求确实落在这个节点上。
-- `x-cache` 为 `Hit from cloudfront`，说明这个节点已经有缓存。
-- `etag` 等于 S3 上这个文件的 ETag，说明缓存的是新版本。S3 上的 ETag 可以用 `aws s3api head-object --bucket <桶> --key <key> --query ETag` 查看。
+- `x-amz-cf-pop` equals `NODE`: the request really reached this location.
+- `x-cache` is `Hit from cloudfront`: this location already has the file cached.
+- `etag` equals the file's ETag in S3: the cached copy is the new version. Check the S3 ETag with `aws s3api head-object --bucket <bucket> --key <key> --query ETag`.
 
-几点说明：
+Notes:
 
-- **节点代码要用这次预热过的。** 节点会上线下线，网页或旧列表里的节点可能已经不在当前列表中，Lambda 不会预热它，有的甚至连不上。在中心栈的日志组里用 Logs Insights 查这个文件预热成功的节点：
+- **Use a location code from this prewarm.** Edge locations come and go. A location from a web page or an old list may no longer be in the current list, so the Lambda won't prewarm it, and some can't be reached at all. Query the central stack's log group with Logs Insights for the locations where this file was prewarmed successfully:
 
   ```
   fields node, x_cache, etag_match
@@ -235,26 +235,26 @@ age: 55
   | sort node
   ```
 
-- **没有任何输出**：说明从你的网络连不上这个节点，和是否预热无关。可以去掉 `-s` 看 curl 的报错，或换一个节点、换一个网络再试。
-- 用 `-I` 只取响应头，不会下载整个文件。
-- 请求一定要带 `Accept-Encoding: gzip, deflate, br`。不带这个头请求的是另一份缓存，会显示 `Miss`。
+- **No output at all**: your network can't reach this location, which has nothing to do with prewarming. Remove `-s` to see curl's error, or try another location or another network.
+- `-I` fetches only the response headers and doesn't download the whole file.
+- Always send `Accept-Encoding: gzip, deflate, br`. Without this header you hit a different cached copy and see `Miss`.
 
-## 容错
+## Fault tolerance
 
-- 单个节点的任何错误只记为这个节点 `failed`，其他节点照常。失败的节点不重试。
-- 一个文件匹配多条路径时，某条路径的域名找不到分发，只跳过这一条，记一条 ERROR 日志，写入 `skipped_urls`，其他路径照常。
-- Lambda 最长运行 15 分钟。剩余时间不足 60 秒时不再发起新请求，下载中的请求在剩余 15 秒时中止，保证所有节点的结果和汇总都能写进日志。因时间不够没做完的节点不会触发重试，因为重试还会遇到同样的时间限制。
-- 节点列表拉不到时，依次改用上次拉取成功的列表和内置快照，见"节点列表"一节。
+- Any error at a single edge location only marks that location as `failed`; the other locations continue. Failed locations are not retried.
+- If a file matches several paths and the domain of one path has no matching distribution, only that path is skipped: an ERROR log entry is written, the URL is added to `skipped_urls`, and the other paths continue.
+- The Lambda runs for at most 15 minutes. With less than 60 seconds left it sends no new requests, and in-flight downloads are stopped at 15 seconds left, so that every location's result and the summary make it into the logs. Locations left unfinished for lack of time don't trigger a retry, because a retry would hit the same time limit.
+- If the edge location list can't be fetched, the last successfully fetched list and then the built-in snapshot are used. See "Edge location list".
 
-以下情况本次调用失败，Lambda 自动再重试 2 次（共 3 次）：
+In the following cases the invocation fails, and Lambda retries it 2 more times (3 attempts in total):
 
-- 发起的请求一个都没成功，并且至少有一个是 `failed`。
-- 匹配的路径都找不到分发。
-- 配置的国家和城市全都匹配不到节点。
-- 配置错误，例如 `S3Paths` 和 `CdnUrlPrefixes` 条数不一致。
-- 失效请求报错，或者 5 分钟内没有完成。
+- None of the requests sent succeeded, and at least one was `failed`.
+- None of the matching paths has a matching distribution.
+- None of the configured countries and cities matches any edge location.
+- Configuration error, for example `S3Paths` and `CdnUrlPrefixes` have different numbers of entries.
+- The invalidation request returns an error or doesn't complete within 5 minutes.
 
-3 次都失败的事件直接丢弃，不保存，每次失败的原因都记在日志组里。方案没有用死信队列，因为预热漏掉一次的影响很小：用户第一次访问时节点会自己回源，只是这一次慢一点。需要补预热时，重新上传该文件即可。查 Lambda 报错的日志：
+Events that fail all 3 attempts are dropped without being stored, and the reason for each failure is in the log group. The solution doesn't use a dead-letter queue because missing a prewarm has little impact: on the first user request the edge location fetches from the origin itself, and only that one request is slower. To prewarm again, upload the file again. Log query for Lambda errors:
 
 ```
 fields @timestamp, errorType, errorMessage, message
@@ -262,16 +262,16 @@ fields @timestamp, errorType, errorMessage, message
 | sort @timestamp desc
 ```
 
-调用失败时，错误原因在 `errorMessage` 字段；跳过某条路径时，原因在 `message` 字段。
+When an invocation fails, the reason is in the `errorMessage` field. When a path is skipped, the reason is in the `message` field.
 
-EventBridge 跨区域转发失败时会自动重试，最长 24 小时，之后同样丢弃。
+If cross-region forwarding in EventBridge fails, EventBridge retries automatically for up to 24 hours and then drops the event as well.
 
-## 注意事项
+## Caveats
 
-- **分发必须允许缓存。** 如果缓存策略是 `Managed-CachingDisabled` 或 TTL 为 0，预热不会有效果。
-- **流量与费用。** 每上传一个文件，Lambda 从 CloudFront 下载的流量约为 `文件大小 × 节点数`，例如 100 MB 文件预热 50 个节点就是 5 GB，按 CloudFront 数据传输费计费。回源 S3 的流量会少一些，因为多个节点共用区域边缘缓存。CloudFront 失效每月前 1000 条路径免费，之后每条 $0.005。
-- **压缩版本。** 预热请求带 `Accept-Encoding: gzip, deflate, br`，与浏览器一致。不带该头的客户端（例如默认的 curl）命中的是另一份缓存。
-- **节点列表。** 列表来自第三方站点 static.cloudping.cloud，有些节点可能已经下线。下线节点会记为失败，不影响其他节点。一个节点通常有多个 IP，某个 IP 连不上时会换下一个。
-- **不要监控日志写入的路径。** 如果桶的访问日志或 CloudFront 日志写在被监控的路径下，每次预热产生的日志又会触发预热，形成循环。
-- **改配置。** 直接在 Lambda 控制台改环境变量可以立即生效，但下次更新栈时会被模板参数覆盖。长期修改请更新栈参数。
-- **删除事件。** 删除事件不触发任何操作。
+- **The distribution must allow caching.** If the cache policy is `Managed-CachingDisabled` or the TTL is 0, prewarming has no effect.
+- **Traffic and cost.** For every uploaded file, the Lambda downloads about `file size × number of locations` from CloudFront. For example, prewarming a 100 MB file at 50 locations is 5 GB, billed as CloudFront data transfer. Origin traffic from S3 is lower, because several locations share a regional edge cache. The first 1,000 CloudFront invalidation paths each month are free, and each additional path costs $0.005.
+- **Compressed versions.** Prewarm requests send `Accept-Encoding: gzip, deflate, br`, like a browser. Clients that don't send this header (for example curl by default) hit a different cached copy.
+- **Edge location list.** The list comes from a third-party site, static.cloudping.cloud, and some locations in it may be offline. Offline locations are recorded as failed and don't affect the others. A location usually has several IPs, and the next IP is tried when one can't be reached.
+- **Don't monitor paths that logs are written to.** If the bucket's access logs or CloudFront logs are written under a monitored path, the logs produced by each prewarm trigger another prewarm, creating a loop.
+- **Changing configuration.** Editing environment variables in the Lambda console takes effect immediately, but the next stack update overwrites them with the template parameters. For lasting changes, update the stack parameters.
+- **Delete events.** Delete events don't trigger anything.
