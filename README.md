@@ -85,9 +85,8 @@ fields @timestamp, url, node, outcome, error
 DOMAIN=www.example.com              # domain in CdnUrlPrefixes
 FILE_PATH='/static/js/my_app.js'
 NODE=NRT12-P5                       # location code from this file's prewarm_result logs
+DIST=d111111abcdef8                 # prefix of the distribution domain dxxxx.cloudfront.net
 
-DIST=$(aws cloudfront list-distributions --output text \
-  --query "DistributionList.Items[?Aliases.Items && contains(Aliases.Items, '$DOMAIN')].DomainName | [0]" | cut -d. -f1)
 URL_PATH=$(jq -rn --arg p "$FILE_PATH" '$p | split("/") | map(@uri) | join("/")')
 
 curl -sI -m 15 --retry 3 --retry-all-errors -H 'Accept-Encoding: gzip, deflate, br' \
@@ -95,7 +94,7 @@ curl -sI -m 15 --retry 3 --retry-all-errors -H 'Accept-Encoding: gzip, deflate, 
   "https://$DOMAIN$URL_PATH" | grep -iE '^(HTTP/|x-cache:|x-amz-cf-pop:|etag:|age:)'
 ```
 
-A successful prewarm shows `x-amz-cf-pop` equal to `NODE`, `x-cache: Hit from cloudfront`, and the same `etag` as in S3. No output means your network can't reach that location.
+A successful prewarm shows `x-amz-cf-pop` equal to `NODE`, `x-cache: Hit from cloudfront` (or `RefreshHit`, meaning the cached copy expired and was revalidated with the origin), and the same `etag` as in S3. No output means your network can't reach that location.
 
 ## Caveats
 
