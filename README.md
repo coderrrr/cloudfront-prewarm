@@ -191,7 +191,7 @@ After uploading a file, request it from a specific edge location with curl to ch
 
 ```bash
 DOMAIN=www.example.com              # the domain in CdnUrlPrefixes
-FILE_PATH='/static/js/my app.js'    # path of the file to check; may contain spaces or non-ASCII characters, it is URL-encoded below
+FILE_PATH='/static/js/my_app.js'    # path of the file to check; may contain spaces or non-ASCII characters, it is URL-encoded below
 NODE=NRT12-P5                       # location code, taken from this prewarm's prewarm_result logs; see notes below
 
 # Prefix of the distribution domain dxxxx.cloudfront.net. If the domain uses a wildcard alternate domain name (*.example.com), this lookup finds nothing; copy it from the CloudFront console instead
